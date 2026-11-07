@@ -537,7 +537,7 @@ private:
     bool wolCapable;
     bool enableTSO4;
     bool enableTSO6;
-    bool useAppleVTD;
+    bool useIOMapper;
     bool hasSensor;
     
 #ifdef DEBUG_INTR

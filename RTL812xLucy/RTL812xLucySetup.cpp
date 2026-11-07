@@ -81,7 +81,6 @@ struct rtlMediumTable mediumArray[MIDX_COUNT] = {
 void RTL8125::getParams()
 {
     OSDictionary *params;
-    OSIterator *iterator;
     OSString *versionString;
     OSString *fbAddr;
     OSBoolean *tsoV4;
@@ -91,24 +90,14 @@ void RTL8125::getParams()
     OSNumber *tv;
     UInt32 interval;
     
-    if (version_major >= Tahoe) {
-        params = serviceMatching("AppleVTD");
-        
-        if (params) {
-            iterator = IOService::getMatchingServices(params);
-            
-            if (iterator) {
-                IOMapper *mp = OSDynamicCast(IOMapper, iterator->getNextObject());
-                
-                if (mp) {
-                    IOLog("AppleVTD is enabled.");
-                    useAppleVTD = true;
-                }
-                iterator->release();
-            }
-            params->release();
-        }
-    }
+    /* Enable the mapped DMA path whenever this device has an IOMapper.
+     * copyMapperForDevice() resolves the device's "iommu-parent" property, so
+     * this covers AppleVTD, DART and a third-party mapper such as the AMD IOMMU
+     * driver alike. Without a mapper the device keeps physical DMA. */
+    useIOMapper = (mapper != NULL);
+    if (useIOMapper)
+        IOLog("IOMapper is enabled.\n");
+    setProperty("rtl812x-mapped-dma", useIOMapper ? "yes" : "no");
     versionString = OSDynamicCast(OSString, getProperty(kDriverVersionName));
 
     params = OSDynamicCast(OSDictionary, getProperty(kParamName));
@@ -300,7 +289,7 @@ bool RTL8125::initEventSources(IOService *provider)
     if (msiIndex != -1) {
         DebugLog("MSI interrupt index: %d\n", msiIndex);
         
-        if (useAppleVTD) {
+        if (useIOMapper) {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8125::interruptOccurredVTD), provider, msiIndex);
         } else {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8125::interruptOccurred), provider, msiIndex);
@@ -412,7 +401,7 @@ bool RTL8125::setupRxResources()
         }
         rxBufArray[i].mbuf = m;
 
-        if (!useAppleVTD) {
+        if (!useIOMapper) {
             word1 = (kRxBufferSize | DescOwn);
 
             if (i == kRxLastDesc)
@@ -425,7 +414,7 @@ bool RTL8125::setupRxResources()
             rxDescArray[i].buf.addr = OSSwapHostToLittleInt64(pa);
         }
     }
-    if (useAppleVTD)
+    if (useIOMapper)
         result = setupRxMap();
     else
         result = true;
@@ -519,7 +508,7 @@ bool RTL8125::setupTxResources()
     txNumFreeDesc = kNumTxDesc;
     txTailPtr0 = txClosePtr0 = 0;
 
-    if (useAppleVTD) {
+    if (useIOMapper) {
         result = setupTxMap();
         
         if (!result)
@@ -633,7 +622,7 @@ void RTL8125::freeRxResources()
 {
     UInt32 i;
         
-    if (useAppleVTD)
+    if (useIOMapper)
         freeRxMap();
 
     if (rxDescDmaCmd) {
@@ -665,7 +654,7 @@ void RTL8125::freeRxResources()
 
 void RTL8125::freeTxResources()
 {
-    if (useAppleVTD)
+    if (useIOMapper)
         freeTxMap();
     else
         RELEASE(txMbufCursor);
@@ -718,7 +707,7 @@ void RTL8125::clearRxTxRings()
     
     DebugLog("clearRxTxRings() ===>\n");
     
-    if (useAppleVTD && txMapInfo) {
+    if (useIOMapper && txMapInfo) {
         for (i = 0; i < kNumTxMemDesc; i++) {
             md = txMapInfo->txMemIO[i];
             
@@ -744,7 +733,7 @@ void RTL8125::clearRxTxRings()
     txDirtyDescIndex = txNextDescIndex = 0;
     txNumFreeDesc = kNumTxDesc;
         
-    if (useAppleVTD)
+    if (useIOMapper)
         rxMapBuffers(0, kNumRxMemDesc);
 
     for (i = 0; i < kNumRxDesc; i++) {

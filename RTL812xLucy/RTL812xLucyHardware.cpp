@@ -127,6 +127,12 @@ IOReturn RTL8125::setPowerStateWakeAction(OSObject *owner, void *arg1, void *arg
         
         dev->extendedConfigWrite16(offset, val16);
     }
+    /* The chip does not keep its state across S3: the ring base registers come
+     * back cleared, so the link renegotiates but nothing is received until the
+     * interface is cycled. Run the same recovery the TX deadlock path uses. */
+    if (ethCtlr && test_bit(__ENABLED, &ethCtlr->stateFlags))
+        ethCtlr->rtl812xRestart();
+
     return kIOReturnSuccess;
 }
 

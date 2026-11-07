@@ -240,7 +240,7 @@ bool RTL8125::init(OSDictionary *properties)
         wolCapable = false;
         enableTSO4 = false;
         enableTSO6 = false;
-        useAppleVTD = false;
+        useIOMapper = false;
         hasSensor = false;
         pciPMCtrlOffset = 0;
         memset(fallBackMacAddr.bytes, 0, kIOEthernetAddressSize);
@@ -319,23 +319,21 @@ bool RTL8125::start(IOService *provider)
         IOLog("Failed to open provider.\n");
         goto error_open;
     }
-    mapper = IOMapper::copyMapperForDevice(pciDevice);
+    /* The iommu-parent property can be published just after the PCI device
+     * appears, so poll briefly before falling back to physical DMA. enable()
+     * takes the decision again once the interface is brought up, which is the
+     * case where the mapper really is late (see the switch there). */
+    for (UInt32 attempt = 0; attempt < 40 && !mapper; attempt++) {
+        mapper = IOMapper::copyMapperForDevice(pciDevice);
+        if (!mapper)
+            IOSleep(5);
+    }
+    /* Observable from ioreg: proves which DMA path this interface took. */
+    setProperty("rtl812x-mapper", (mapper != NULL) ? "present" : "absent");
 
     getParams();
-
-#if defined(__arm64__)
-    /*
-     * On Apple Silicon all PCIe/Thunderbolt DMA is translated by DART.
-     * Raw physical addresses would fault, so the mapper-aware code path
-     * (historically the AppleVTD path) is mandatory whenever the device
-     * has a system mapper.
-     */
-    if (mapper && !useAppleVTD) {
-        IOLog("DART mapper present, using mapped DMA path.\n");
-        useAppleVTD = true;
-    }
-#endif
     
+
     if (!initPCIConfigSpace(pciDevice)) {
         goto error_cfg;
     }
@@ -541,6 +539,29 @@ IOReturn RTL8125::enable(IONetworkInterface *netif)
         selectedMedium = mediumTable[MIDX_AUTO];
     }
     selectMedium(selectedMedium);
+
+    /* The mapper may publish iommu-parent only after this driver has started,
+     * so take the decision once more here, before the rings are armed.
+     * Everything below reads useIOMapper, including clearRxTxRings() and
+     * rxMapBuffers(), so the mapped resources have to exist first. */
+    if (!useIOMapper) {
+        if (!mapper)
+            mapper = IOMapper::copyMapperForDevice(pciDevice);
+
+        if (mapper) {
+            if (setupRxMap() && setupTxMap()) {
+                useIOMapper = true;
+                setProperty("rtl812x-mapper", "present");
+                setProperty("rtl812x-mapped-dma", "yes");
+                IOLog("IOMapper appeared late, using mapped DMA.\n");
+            } else {
+                IOLog("Couldn't set up mapped DMA; keeping physical DMA.\n");
+                freeRxMap();
+                freeTxMap();
+            }
+        }
+    }
+
     rtl812xEnable();
     
     /* We have to enable the interrupt because we are using a msi interrupt. */
@@ -633,7 +654,7 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
         DebugLog("Interface down. Dropping packets.\n");
         goto done;
     }
-    while ((txNumFreeDesc > (kMaxSegs + 3)) && (interface->dequeueOutputPackets(1, &m, NULL, NULL, NULL) == kIOReturnSuccess)) {
+    while ((txNumFreeDesc > (kMaxSegs + 3)) && (!useIOMapper || txMapInfo->txNumFreeMem > 1) && (interface->dequeueOutputPackets(1, &m, NULL, NULL, NULL) == kIOReturnSuccess)) {
         cmd = 0;
         opts2 = 0;
 
@@ -696,7 +717,7 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
                 opts2 = TxIPCS_C;
         }
         /* Finally get the physical segments. */
-        if (useAppleVTD)
+        if (useIOMapper)
             numSegs = txMapPacket(m, txSegments, kMaxSegs);
         else
             numSegs = txMbufCursor->getPhysicalSegmentsWithCoalesce(m, txSegments, kMaxSegs);
@@ -753,7 +774,7 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
     /* Update tail pointer. */
     rtl812xDoorbell(&linuxData, txTailPtr0);
 
-    result = (txNumFreeDesc > (kMaxSegs + 3)) ? kIOReturnSuccess : kIOReturnNoResources;
+    result = (txNumFreeDesc > (kMaxSegs + 3) && (!useIOMapper || txMapInfo->txNumFreeMem > 1)) ? kIOReturnSuccess : kIOReturnNoResources;
     
 done:
     //DebugLog("outputStart() <===\n");
@@ -1168,7 +1189,7 @@ void RTL8125::txInterrupt()
         txMbufArray[txDirtyDescIndex] = NULL;
 
         if (m) {
-            if (useAppleVTD)
+            if (useIOMapper)
                 txUnmapPacket();
 
             freePacket(m, kDelayFree);
@@ -1596,7 +1617,7 @@ void RTL8125::pollInputPackets(IONetworkInterface *interface, uint32_t maxCount,
     if (test_bit(__POLL_MODE, &stateFlags) &&
         !test_and_set_bit(__POLLING, &stateFlags)) {
 
-        if (useAppleVTD)
+        if (useIOMapper)
             rxInterruptVTD(interface, maxCount, pollQueue, context);
         else
             rxInterrupt(interface, maxCount, pollQueue, context);
