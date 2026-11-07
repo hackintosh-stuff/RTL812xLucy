@@ -508,6 +508,13 @@ void RTL8125::rtl812xEnable()
     rtl812xHwConfig(tp);
     
     rtl812xSetPhyMedium(tp, tp->autoneg, tp->speed, tp->duplex, tp->advertising);
+
+    /* A reset (including the wake restart) clears RxConfig. Multicast is
+     * restored by rtl812xHwConfig(), promiscuous mode is not, and the stack
+     * does not necessarily re-apply it. Upstream fixed this in 1.1.3 the same
+     * way; only this line is taken from that release. */
+    if (test_bit(__PROMISC, &stateFlags))
+        setPromiscuousMode(true);
 }
 
 void RTL8125::rtl812xDisable()
